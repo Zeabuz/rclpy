@@ -262,13 +262,15 @@ class ActionServer(Waitable):
         callback_group.add_entity(self)
         self._node.add_waitable(self)
 
+        self._debug_logger = self._node.get_logger().get_child('action_server_debug_logger')
+
     async def _execute_goal_request(self, request_header_and_message):
         request_header, goal_request = request_header_and_message
         goal_uuid = goal_request.goal_id
         goal_info = GoalInfo()
         goal_info.goal_id = goal_uuid
 
-        self._node.get_logger().debug('New goal request with ID: {0}'.format(goal_uuid.uuid))
+        self._debug_logger.debug('New goal request with ID: {0}'.format(goal_uuid.uuid))
 
         # Check if goal ID is already being tracked by this action server
         with self._lock:
@@ -279,7 +281,7 @@ class ActionServer(Waitable):
             # Call user goal callback
             response = await await_or_execute(self._goal_callback, goal_request.goal)
             if not isinstance(response, GoalResponse):
-                self._node.get_logger().warning(
+                self._debug_logger.warning(
                     'Goal request callback did not return a GoalResponse type. Rejecting goal.')
             else:
                 accepted = GoalResponse.ACCEPT == response
@@ -293,13 +295,15 @@ class ActionServer(Waitable):
                 with self._lock:
                     goal_handle = ServerGoalHandle(self, goal_info, goal_request.goal)
             except RuntimeError as e:
-                self._node.get_logger().error(
+                self._debug_logger.error(
                     'Failed to accept new goal with ID {0}: {1}'.format(goal_uuid.uuid, e))
                 accepted = False
             else:
                 self._goal_handles[bytes(goal_uuid.uuid)] = goal_handle
+                self._debug_logger.debug(f'Adding new future with key {bytes(goal_uuid.uuid)}')
                 self._result_futures[bytes(goal_uuid.uuid)] = Future()
                 self.add_future(self._result_futures[bytes(goal_uuid.uuid)])
+                self._debug_logger.debug(f'Added new future. Keys in future list: {self._result_futures.keys()}')
 
         # Send response
         response_msg = self._action_type.Impl.SendGoalService.Response()
@@ -308,17 +312,17 @@ class ActionServer(Waitable):
         self._handle.send_goal_response(request_header, response_msg)
 
         if not accepted:
-            self._node.get_logger().debug('New goal rejected: {0}'.format(goal_uuid.uuid))
+            self._debug_logger.debug('New goal rejected: {0}'.format(goal_uuid.uuid))
             return
 
-        self._node.get_logger().debug('New goal accepted: {0}'.format(goal_uuid.uuid))
+        self._debug_logger.debug('New goal accepted: {0}'.format(goal_uuid.uuid))
 
         # Provide the user a reference to the goal handle
         await await_or_execute(self._handle_accepted_callback, goal_handle)
 
     async def _execute_goal(self, execute_callback, goal_handle):
         goal_uuid = goal_handle.goal_id.uuid
-        self._node.get_logger().debug('Executing goal with ID {0}'.format(goal_uuid))
+        self._debug_logger.debug('Executing goal with ID {0}'.format(goal_uuid))
 
         try:
             # Execute user callback
@@ -326,28 +330,33 @@ class ActionServer(Waitable):
         except Exception as ex:
             # Create an empty result so that we can still send a response to the client
             execute_result = self._action_type.Result()
-            self._node.get_logger().error('Error raised in execute callback: {0}'.format(ex))
+            self._debug_logger.error('Error raised in execute callback: {0}'.format(ex))
             traceback.print_exc()
 
         # If user did not trigger a terminal state, assume aborted
         if goal_handle.is_active:
-            self._node.get_logger().warning(
+            self._debug_logger.warning(
                 'Goal state not set, assuming aborted. Goal ID: {0}'.format(goal_uuid))
             goal_handle.abort()
 
-        self._node.get_logger().debug(
+        self._debug_logger.debug(
             'Goal with ID {0} finished with state {1}'.format(goal_uuid, goal_handle.status))
 
         # Set result
         result_response = self._action_type.Impl.GetResultService.Response()
         result_response.status = goal_handle.status
         result_response.result = execute_result
-        self._result_futures[bytes(goal_uuid)].set_result(result_response)
+        try:
+            self._debug_logger.debug(f'Setting result for goal handle with key {bytes(goal_uuid)}. List of keys: {self._result_futures.keys()}')
+            self._result_futures[bytes(goal_uuid)].set_result(result_response)
+        except KeyError as e:
+            self._debug_logger.error(f'Error setting result! Exception: {e}, list of keys {self._result_futures.keys()}')
+            raise e
 
     async def _execute_cancel_request(self, request_header_and_message):
         request_header, cancel_request = request_header_and_message
 
-        self._node.get_logger().debug('Cancel request received: {0}'.format(cancel_request))
+        self._debug_logger.debug('Cancel request received: {0}'.format(cancel_request))
 
         with self._lock:
             # Get list of goals that are requested to be canceled
@@ -371,7 +380,7 @@ class ActionServer(Waitable):
                     # that will generate an exception from invalid transition.
                     goal_handle._update_state(GoalEvent.CANCEL_GOAL)
                 except RCLError as ex:
-                    self._node.get_logger().debug(
+                    self._debug_logger.debug(
                         'Failed to cancel goal in cancel callback: {0}'.format(ex))
                     # Remove from response since goal has been succeeded
                     cancel_response.goals_canceling.remove(goal_info)
@@ -385,12 +394,12 @@ class ActionServer(Waitable):
         request_header, result_request = request_header_and_message
         goal_uuid = result_request.goal_id.uuid
 
-        self._node.get_logger().debug(
+        self._debug_logger.debug(
             'Result request received for goal with ID: {0}'.format(goal_uuid))
 
         # If no goal with the requested ID exists, then return UNKNOWN status
         if bytes(goal_uuid) not in self._goal_handles:
-            self._node.get_logger().debug(
+            self._debug_logger.debug(
                 'Sending result response for unknown goal ID: {0}'.format(goal_uuid))
             result_response = self._action_type.Impl.GetResultService.Response()
             result_response.status = GoalStatus.STATUS_UNKNOWN
@@ -403,14 +412,17 @@ class ActionServer(Waitable):
             functools.partial(self._send_result_response, request_header))
 
     async def _execute_expire_goals(self, expired_goals):
+        self._debug_logger.debug("Executing _execute_expire_goals")
         for goal in expired_goals:
             goal_uuid = bytes(goal.goal_id.uuid)
             self._goal_handles[goal_uuid].destroy()
+            self._debug_logger.debug(f"Removing goal with uuid {goal_uuid}")
             del self._goal_handles[goal_uuid]
             self.remove_future(self._result_futures[goal_uuid])
             del self._result_futures[goal_uuid]
 
     def _send_result_response(self, request_header, future):
+        self._debug_logger.debug("Executing _send_result_response function")
         self._handle.send_result_response(request_header, future.result())
 
     @property
